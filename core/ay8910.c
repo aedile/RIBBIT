@@ -68,15 +68,9 @@ static void update_periods(ay8910_t *ay)
     ay->env_period = (uint32_t)(ep ? ep : 1) * 2;
 }
 
-/* advance the chip by one step of its clock/8 timebase */
-static void ay_step(ay8910_t *ay)
+/* one step of the noise generator, on the clock/8 timebase */
+static inline void ay_step_noise(ay8910_t *ay)
 {
-    for (int ch = 0; ch < 3; ch++) {
-        if (++ay->tone_count[ch] >= ay->period[ch]) {
-            ay->tone_count[ch] = 0;
-            ay->tone_out[ch] ^= 1;
-        }
-    }
     if (++ay->noise_count >= ay->noise_period) {   /* the noise generator runs at half the tone rate */
         ay->noise_count = 0;
         /* 17-bit LFSR, taps at bits 0 and 3 */
@@ -84,6 +78,11 @@ static void ay_step(ay8910_t *ay)
         ay->noise_rng = (ay->noise_rng >> 1) | (bit << 16);
         ay->noise_out = (uint8_t)(ay->noise_rng & 1);
     }
+}
+
+/* and one step of the envelope */
+static inline void ay_step_env(ay8910_t *ay)
+{
     if (++ay->env_count >= ay->env_period) {
         ay->env_count = 0;
         if (!ay->env_hold) {
@@ -120,7 +119,29 @@ void ay_render(ay8910_t *ay, int16_t *buf, int samples, int rate)
 {
     /* the tone counters are clocked at clock/8 */
     uint32_t step_per_sample = (uint32_t)(((uint64_t)(ay->clock / 8) << 16) / (uint32_t)rate);
+
+    /*
+     * A board with five of these on it spends most of its time with most of them idle, and
+     * stepping something that cannot make a sound is pure waste. A channel is silent when its
+     * volume register is zero and it is not following the envelope; if all three are, so is the
+     * whole chip, and all that has to happen is that its sample clock keeps moving.
+     */
     uint8_t r7 = ay->reg[7];
+    int active[3], any = 0, need_noise = 0, need_env = 0;
+    for (int ch = 0; ch < 3; ch++) {
+        uint8_t v = ay->reg[8 + ch];
+        active[ch] = (v & 0x1f) != 0;
+        if (!active[ch]) continue;
+        any = 1;
+        if (v & 0x10) need_env = 1;
+        if (!((r7 >> (ch + 3)) & 1)) need_noise = 1;   /* this channel has the noise mixed in */
+    }
+    if (!any) {
+        ay->acc += step_per_sample * (uint32_t)samples;
+        ay->acc &= 0xffff;
+        return;
+    }
+
     for (int i = 0; i < samples; i++) {
         ay->acc += step_per_sample;
         uint32_t steps = ay->acc >> 16;
@@ -128,24 +149,73 @@ void ay_render(ay8910_t *ay, int16_t *buf, int samples, int rate)
         if (steps > 512) steps = 512;         /* never let a stall turn into a freeze */
 
         /*
-         * The chip toggles its square waves far faster than we sample it - nine or ten times
+         * The chip toggles its square waves far faster than we sample it - a dozen times
          * between one output sample and the next - so reading the level once per sample turns
          * every tone above a couple of kHz into whatever aliased mess happens to line up with
          * the sample clock. Counting how many of those steps the channel spent high and taking
-         * the average is the cheap way to band-limit it, and it costs three adds a step.
+         * the average is the cheap way to band-limit it.
          */
         uint32_t hi[3] = { 0, 0, 0 };
         uint32_t n = steps ? steps : 1;
-        for (uint32_t s = 0; s < steps; s++) {
-            ay_step(ay);
-            for (int ch = 0; ch < 3; ch++) {
-                uint8_t tone_dis  = (uint8_t)((r7 >> ch) & 1);
-                uint8_t noise_dis = (uint8_t)((r7 >> (ch + 3)) & 1);
-                hi[ch] += (uint32_t)((tone_dis | ay->tone_out[ch]) & (noise_dis | ay->noise_out));
+#ifdef AY_SLOW_ONLY
+        if (1) {
+#else
+        if (need_noise) {
+#endif
+            /* the slow path: the level is the tone ANDed with the noise, step by step */
+            for (uint32_t s = 0; s < steps; s++) {
+                for (int ch = 0; ch < 3; ch++) {
+                    if (++ay->tone_count[ch] >= ay->period[ch]) {
+                        ay->tone_count[ch] = 0;
+                        ay->tone_out[ch] ^= 1;
+                    }
+                }
+                if (need_noise) ay_step_noise(ay);
+                if (need_env) ay_step_env(ay);
+                for (int ch = 0; ch < 3; ch++) {
+                    if (!active[ch]) continue;
+                    uint8_t tone_dis  = (uint8_t)((r7 >> ch) & 1);
+                    uint8_t noise_dis = (uint8_t)((r7 >> (ch + 3)) & 1);
+                    hi[ch] += (uint32_t)((tone_dis | ay->tone_out[ch]) & (noise_dis | ay->noise_out));
+                }
             }
+        } else {
+            /*
+             * With no noise in the mix a channel is a plain square wave, and how many of the
+             * next `steps` it spends high can be worked out a run at a time instead of a step
+             * at a time. That turns a dozen iterations per channel per sample into one or two,
+             * which is what makes five of these chips fit in the frame at all.
+             */
+            for (int ch = 0; ch < 3; ch++) {
+                uint32_t rem = steps, c = ay->tone_count[ch], p = ay->period[ch];
+                uint8_t o = ay->tone_out[ch];
+                uint8_t tone_dis = (uint8_t)((r7 >> ch) & 1);
+                while (rem) {
+                    /*
+                     * The counter is incremented first and the output flips when it reaches the
+                     * period, so the step that causes the toggle already carries the new level -
+                     * the run at the old one is one step shorter than the distance to it.
+                     */
+                    uint32_t to_toggle = (p > c) ? (p - c) : 1;
+                    if (to_toggle > rem) {
+                        if (active[ch] && (tone_dis | o)) hi[ch] += rem;
+                        c += rem;
+                        rem = 0;
+                    } else {
+                        if (to_toggle > 1 && active[ch] && (tone_dis | o)) hi[ch] += to_toggle - 1;
+                        c = 0; o ^= 1;
+                        if (active[ch] && (tone_dis | o)) hi[ch] += 1;
+                        rem -= to_toggle;
+                    }
+                }
+                ay->tone_count[ch] = (uint16_t)c;
+                ay->tone_out[ch] = o;
+            }
+            if (need_env) for (uint32_t s = 0; s < steps; s++) ay_step_env(ay);
         }
         if (!steps) {
             for (int ch = 0; ch < 3; ch++) {
+                if (!active[ch]) continue;
                 uint8_t tone_dis  = (uint8_t)((r7 >> ch) & 1);
                 uint8_t noise_dis = (uint8_t)((r7 >> (ch + 3)) & 1);
                 hi[ch] = (uint32_t)((tone_dis | ay->tone_out[ch]) & (noise_dis | ay->noise_out));
@@ -158,7 +228,7 @@ void ay_render(ay8910_t *ay, int16_t *buf, int samples, int rate)
             uint8_t v = ay->reg[8 + ch];
             out += (int32_t)((uint32_t)vol_table[(v & 0x10) ? ay->env_out : (v & 0x0f)] * hi[ch] / n);
         }
-        /* the output only ever swings upward from zero, so it carries a fat DC term the
+        /* the output only ever swings upward from zero, so it carries a fat DC term that the
          * cabinet's coupling capacitor removed; a one-pole high pass does the same job here */
         ay->dc += (out - ay->dc) >> 8;
         int32_t mixed = buf[i] + (out - ay->dc);
