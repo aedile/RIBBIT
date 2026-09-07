@@ -26,7 +26,7 @@ void ay_reset(ay8910_t *ay)
     memset(ay->tone_count, 0, sizeof(ay->tone_count));
     memset(ay->tone_out, 0, sizeof(ay->tone_out));
     ay->noise_count = 0; ay->noise_out = 0; ay->noise_rng = 1;
-    ay->env_count = 0; ay->env_step = 0; ay->env_out = 0; ay->env_hold = 0;
+    ay->env_count = 0; ay->env_step = 0; ay->env_out = 0; ay->env_hold = 0; ay->env_attack = 0;
     ay->latch = 0; ay->acc = 0;
     update_periods(ay);
 }
@@ -40,6 +40,8 @@ void ay_data_w(ay8910_t *ay, uint8_t data)
     if (r <= 6 || r == 11 || r == 12) update_periods(ay);
     if (r == 13) {                           /* writing the shape restarts the envelope */
         ay->env_step = 0; ay->env_hold = 0; ay->env_count = 0;
+        ay->env_attack = (uint8_t)((data >> 2) & 1);
+        ay->env_out = (uint8_t)(ay->env_attack ? 0 : 15);
     }
 }
 
@@ -60,8 +62,10 @@ static void update_periods(ay8910_t *ay)
     }
     uint16_t np = (uint16_t)(ay->reg[6] & 0x1f);
     ay->noise_period = (uint16_t)((np ? np : 1) * 2);
+    /* The datasheet gives the envelope a full cycle every 256*EP clocks, so one of its sixteen
+     * steps is 16*EP clocks - two ticks of this clock/8 timebase, not one. */
     uint16_t ep = (uint16_t)(ay->reg[11] | (ay->reg[12] << 8));
-    ay->env_period = ep ? ep : 1;
+    ay->env_period = (uint32_t)(ep ? ep : 1) * 2;
 }
 
 /* advance the chip by one step of its clock/8 timebase */
@@ -83,25 +87,31 @@ static void ay_step(ay8910_t *ay)
     if (++ay->env_count >= ay->env_period) {
         ay->env_count = 0;
         if (!ay->env_hold) {
-            ay->env_step++;
-            uint8_t shape = ay->reg[13] & 0x0f;
-            if (ay->env_step > 31) {
-                if (!(shape & 0x08)) {        /* one ramp, then silence */
-                    ay->env_step = 31; ay->env_hold = 1; ay->env_out = 0;
-                } else if (shape & 0x01) {    /* hold at the end of the ramp */
-                    ay->env_step = 31; ay->env_hold = 1;
-                    ay->env_out = (shape & 0x02) ? ((shape & 0x04) ? 0 : 15) : ((shape & 0x04) ? 15 : 0);
+            /*
+             * The envelope is a sixteen-step ramp, and register 13's four bits say what happens
+             * when it reaches the end: CONT decides whether there is a second cycle at all,
+             * HOLD freezes it there, and ALT flips the direction each time round. Running a
+             * thirty-two step counter and taking the low nibble - which is what this used to do
+             * - ramps twice per cycle and never holds, which is audibly wrong on anything that
+             * leans on the envelope for its shape.
+             */
+            uint8_t shape = (uint8_t)(ay->reg[13] & 0x0f);
+            int cont = (shape >> 3) & 1, att = (shape >> 2) & 1;
+            int alt = (shape >> 1) & 1, hold = shape & 1;
+            if (++ay->env_step > 15) {
+                if (!cont) {                       /* one ramp, then silence */
+                    ay->env_hold = 1; ay->env_out = 0; ay->env_step = 15;
+                } else if (hold) {                 /* one ramp, then frozen */
+                    ay->env_hold = 1;
+                    ay->env_out = (uint8_t)((att ^ alt) ? 15 : 0);
+                    ay->env_step = 15;
                 } else {
-                    ay->env_step = 0;         /* free running */
+                    if (alt) ay->env_attack ^= 1;  /* turn round and go back */
+                    ay->env_step = 0;
                 }
             }
-            if (!ay->env_hold) {
-                uint8_t pos = (uint8_t)(ay->env_step & 0x0f);
-                int rising = (shape & 0x04) ? 1 : 0;
-                if ((shape & 0x08) && (shape & 0x02) && (ay->env_step & 0x10)) rising = !rising;
-                if (!(shape & 0x08) && (ay->env_step & 0x10)) rising = rising;   /* single ramp */
-                ay->env_out = (uint8_t)(rising ? pos : 15 - pos);
-            }
+            if (!ay->env_hold)
+                ay->env_out = (uint8_t)(ay->env_attack ? ay->env_step : 15 - ay->env_step);
         }
     }
 }
@@ -110,24 +120,49 @@ void ay_render(ay8910_t *ay, int16_t *buf, int samples, int rate)
 {
     /* the tone counters are clocked at clock/8 */
     uint32_t step_per_sample = (uint32_t)(((uint64_t)(ay->clock / 8) << 16) / (uint32_t)rate);
+    uint8_t r7 = ay->reg[7];
     for (int i = 0; i < samples; i++) {
         ay->acc += step_per_sample;
         uint32_t steps = ay->acc >> 16;
         ay->acc &= 0xffff;
         if (steps > 512) steps = 512;         /* never let a stall turn into a freeze */
-        for (uint32_t s = 0; s < steps; s++) ay_step(ay);
+
+        /*
+         * The chip toggles its square waves far faster than we sample it - nine or ten times
+         * between one output sample and the next - so reading the level once per sample turns
+         * every tone above a couple of kHz into whatever aliased mess happens to line up with
+         * the sample clock. Counting how many of those steps the channel spent high and taking
+         * the average is the cheap way to band-limit it, and it costs three adds a step.
+         */
+        uint32_t hi[3] = { 0, 0, 0 };
+        uint32_t n = steps ? steps : 1;
+        for (uint32_t s = 0; s < steps; s++) {
+            ay_step(ay);
+            for (int ch = 0; ch < 3; ch++) {
+                uint8_t tone_dis  = (uint8_t)((r7 >> ch) & 1);
+                uint8_t noise_dis = (uint8_t)((r7 >> (ch + 3)) & 1);
+                hi[ch] += (uint32_t)((tone_dis | ay->tone_out[ch]) & (noise_dis | ay->noise_out));
+            }
+        }
+        if (!steps) {
+            for (int ch = 0; ch < 3; ch++) {
+                uint8_t tone_dis  = (uint8_t)((r7 >> ch) & 1);
+                uint8_t noise_dis = (uint8_t)((r7 >> (ch + 3)) & 1);
+                hi[ch] = (uint32_t)((tone_dis | ay->tone_out[ch]) & (noise_dis | ay->noise_out));
+            }
+        }
 
         int32_t out = 0;
         for (int ch = 0; ch < 3; ch++) {
-            uint8_t tone_dis  = (uint8_t)((ay->reg[7] >> ch) & 1);
-            uint8_t noise_dis = (uint8_t)((ay->reg[7] >> (ch + 3)) & 1);
-            /* a disabled source is held high, so the channel is the AND of the two */
-            uint8_t level = (uint8_t)((tone_dis | ay->tone_out[ch]) & (noise_dis | ay->noise_out));
-            if (!level) continue;
+            if (!hi[ch]) continue;
             uint8_t v = ay->reg[8 + ch];
-            out += vol_table[(v & 0x10) ? ay->env_out : (v & 0x0f)];
+            out += (int32_t)((uint32_t)vol_table[(v & 0x10) ? ay->env_out : (v & 0x0f)] * hi[ch] / n);
         }
-        int32_t mixed = buf[i] + out;
+        /* the output only ever swings upward from zero, so it carries a fat DC term the
+         * cabinet's coupling capacitor removed; a one-pole high pass does the same job here */
+        ay->dc += (out - ay->dc) >> 8;
+        int32_t mixed = buf[i] + (out - ay->dc);
         buf[i] = (int16_t)(mixed > 32767 ? 32767 : (mixed < -32768 ? -32768 : mixed));
+        r7 = ay->reg[7];
     }
 }

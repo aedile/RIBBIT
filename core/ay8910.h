@@ -14,16 +14,18 @@ typedef uint8_t (*ay_port_read_fn)(void *ctx, int port);   /* port 0 = A, 1 = B 
 
 typedef struct {
     uint8_t reg[16];
+    int32_t dc;                 /* running DC estimate for the output high pass */
     uint8_t latch;                 /* the register the next data write lands in */
     /* tone: a counter per channel, clocked at clock/8, toggling the output on underflow */
     uint16_t tone_count[3];
-    uint16_t period[3], noise_period, env_period;   /* kept in step with the registers */
+    uint16_t period[3], noise_period;
+    uint32_t env_period;           /* two clock/8 ticks per envelope step, so up to 0x1FFFE */
     uint8_t tone_out[3];
     uint16_t noise_count;
     uint8_t noise_out;
     uint32_t noise_rng;
-    uint16_t env_count;
-    uint8_t env_step, env_out, env_hold;
+    uint32_t env_count;
+    uint8_t env_step, env_out, env_hold, env_attack;
     uint32_t clock;
     uint32_t acc;                  /* 16.16 fraction of an AY step carried between samples */
     ay_port_read_fn port_read;
